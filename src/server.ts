@@ -1,18 +1,14 @@
-import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
+import express from 'express';
+import http from 'http';
+import path from 'path';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import path from 'path';
 import fetch from 'node-fetch';
+import { WebSocketServer, WebSocket } from 'ws';
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'tox-secret-key-change-in-prod';
 const GIPHY_KEY = 'hwhnpVCf0AQTX898mvXm9NPkHH4mqtYX';
-
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname, '../public')));
 
 // ── In-memory store ──
 interface User {
@@ -26,6 +22,7 @@ interface User {
 interface Post {
   id: string;
   userId: string;
+  username: string;      // ← NEW: display name stored alongside the id
   content: string;
   media?: string;
   gif?: string;
@@ -62,187 +59,333 @@ const reputationLog: Map<string, string> = new Map();
 
 const uid = () => Math.random().toString(36).slice(2, 10);
 
-// ── Auth middleware ──
-function auth(req: Request, res: Response, next: NextFunction) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET) as { id: string; username: string };
-    (req as any).user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+// ── HTTP layer (static assets only) ──
+const app = express();
+app.use(express.static(path.join(__dirname, '../public')));
+const server = http.createServer(app);
+
+// ── WebSocket layer ──
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+interface ClientState {
+  ws: WebSocket;
+  username?: string;
+  userId?: string;
+  alive: boolean;
+}
+const clients = new Set<ClientState>();
+
+function send(ws: WebSocket, payload: unknown): void {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+}
+
+function broadcast(event: string, data: unknown): void {
+  const frame = JSON.stringify({ event, data });
+  for (const c of clients) {
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(frame);
   }
 }
 
-// ── Auth routes ──
-app.post('/api/auth/register', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
-  if (users.has(username)) return res.status(409).json({ error: 'User exists' });
-  const hash = await bcrypt.hash(password, 10);
-  const user: User = { id: uid(), username, password: hash, reputation: 0, blocked: [], createdAt: Date.now() };
-  users.set(username, user);
-  const token = jwt.sign({ id: user.id, username }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, username });
-});
+class RpcError extends Error {}
 
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  const user = users.get(username);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password, user.password);
-  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ id: user.id, username }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, username });
-});
+function requireUser(client: ClientState): User {
+  if (!client.username) throw new RpcError('Unauthorized');
+  const user = users.get(client.username);
+  if (!user) throw new RpcError('Unauthorized');
+  return user;
+}
 
-app.get('/api/users/me', auth, (req, res) => {
-  const { username } = (req as any).user;
-  const user = users.get(username);
-  if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json({ user: { username: user.username, reputation: user.reputation } });
-});
+// ── Request handlers ──
+async function handle(type: string, p: any, client: ClientState): Promise<any> {
+  switch (type) {
+    case 'ping':
+      return { pong: Date.now() };
 
-app.delete('/api/users/me', auth, (req, res) => {
-  const { username } = (req as any).user;
-  users.delete(username);
-  res.json({ ok: true });
-});
+    /* ── Auth ── */
+    case 'auth': {
+      if (!p.token) throw new RpcError('Missing token');
+      let payload: { id: string; username: string };
+      try {
+        payload = jwt.verify(p.token, JWT_SECRET) as { id: string; username: string };
+      } catch {
+        throw new RpcError('Invalid token');
+      }
+      const user = users.get(payload.username);
+      if (!user) throw new RpcError('Invalid token');
+      client.username = user.username;
+      client.userId = user.id;
+      return { username: user.username, reputation: user.reputation };
+    }
 
-app.get('/api/users/:username/profile', auth, (req, res) => {
-  const user = users.get(req.params.username);
-  if (!user) return res.status(404).json({ error: 'Not found' });
-  const userPosts = posts.filter(p => p.userId === user.id);
-  res.json({ user: { username: user.username, reputation: user.reputation, posts: userPosts } });
-});
+    case 'auth.register': {
+      const { username, password } = p;
+      if (!username || !password) throw new RpcError('Missing fields');
+      if (users.has(username)) throw new RpcError('User exists');
+      const hash = await bcrypt.hash(password, 10);
+      const user: User = {
+        id: uid(),
+        username,
+        password: hash,
+        reputation: 0,
+        blocked: [],
+        createdAt: Date.now(),
+      };
+      users.set(username, user);
+      client.username = user.username;
+      client.userId = user.id;
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET, { expiresIn: '7d' });
+      return { token, username };
+    }
 
-app.post('/api/reputation/gift/:username', auth, (req, res) => {
-  const target = users.get(req.params.username);
-  if (!target) return res.status(404).json({ error: 'User not found' });
-  const giver = (req as any).user.username;
-  const today = new Date().toISOString().slice(0, 10);
-  const key = `${giver}:${target.username}`;
-  if (reputationLog.get(key) === today) return res.status(429).json({ error: 'Already gifted today' });
-  reputationLog.set(key, today);
-  target.reputation += 1;
-  res.json({ ok: true, reputation: target.reputation });
-});
+    case 'auth.login': {
+      const { username, password } = p;
+      const user = users.get(username);
+      if (!user) throw new RpcError('Invalid credentials');
+      const ok = await bcrypt.compare(password, user.password);
+      if (!ok) throw new RpcError('Invalid credentials');
+      client.username = user.username;
+      client.userId = user.id;
+      const token = jwt.sign({ id: user.id, username }, JWT_SECRET, { expiresIn: '7d' });
+      return { token, username };
+    }
 
-// ── Friends ──
-app.get('/api/friends', auth, (req, res) => {
-  const me = (req as any).user.username;
-  const friends = friendRequests
-    .filter(f => (f.from === me || f.to === me) && f.status === 'accepted')
-    .map(f => (f.from === me ? f.to : f.from));
-  res.json({ friends });
-});
+    case 'auth.logout': {
+      client.username = undefined;
+      client.userId = undefined;
+      return { ok: true };
+    }
 
-app.post('/api/friends/request', auth, (req, res) => {
-  const me = (req as any).user.username;
-  const { username: target } = req.body;
-  if (!users.has(target)) return res.status(404).json({ error: 'User not found' });
-  const existing = friendRequests.find(f => (f.from === me && f.to === target) || (f.from === target && f.to === me));
-  if (existing) return res.status(409).json({ error: 'Request already exists' });
-  friendRequests.push({ id: uid(), from: me, to: target, status: 'pending' });
-  res.json({ ok: true });
-});
+    /* ── Users ── */
+    case 'users.me': {
+      const user = requireUser(client);
+      return { user: { username: user.username, reputation: user.reputation } };
+    }
 
-app.delete('/api/friends/:id', auth, (req, res) => {
-  const idx = friendRequests.findIndex(f => f.id === req.params.id);
-  if (idx >= 0) friendRequests.splice(idx, 1);
-  res.json({ ok: true });
-});
+    case 'users.delete': {
+      const user = requireUser(client);
+      users.delete(user.username);
+      client.username = undefined;
+      client.userId = undefined;
+      return { ok: true };
+    }
 
-app.post('/api/users/:username/block', auth, (req, res) => {
-  const me = users.get((req as any).user.username);
-  if (me) me.blocked.push(req.params.username);
-  res.json({ ok: true });
-});
+    case 'users.profile': {
+      requireUser(client);
+      const target = users.get(p.username);
+      if (!target) throw new RpcError('Not found');
+      const userPosts = posts.filter((x) => x.userId === target.id);
+      return {
+        user: { username: target.username, reputation: target.reputation, posts: userPosts },
+      };
+    }
 
-// ── Posts / Feed ──
-app.get('/api/posts', (req, res) => {
-  const limit = parseInt(req.query.limit as string) || 20;
-  const offset = parseInt(req.query.offset as string) || 0;
-  const slice = posts.slice(offset, offset + limit);
-  res.json({ posts: slice, total: posts.length });
-});
+    case 'users.block': {
+      const me = requireUser(client);
+      me.blocked.push(p.username);
+      return { ok: true };
+    }
 
-app.post('/api/posts', auth, (req, res) => {
-  const { content, media, gif } = req.body;
-  const user = users.get((req as any).user.username);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const post: Post = { id: uid(), userId: user.id, content, media, gif, createdAt: Date.now() };
-  posts.unshift(post);
-  res.json({ post });
-});
+    case 'reputation.gift': {
+      requireUser(client);
+      const target = users.get(p.username);
+      if (!target) throw new RpcError('User not found');
+      const giver = client.username!;
+      const today = new Date().toISOString().slice(0, 10);
+      const key = `${giver}:${target.username}`;
+      if (reputationLog.get(key) === today) throw new RpcError('Already gifted today');
+      reputationLog.set(key, today);
+      target.reputation += 1;
+      return { ok: true, reputation: target.reputation };
+    }
 
-// ── Sessions ──
-app.get('/api/sessions', auth, (req, res) => {
-  const me = (req as any).user.username;
-  const userSessions = Array.from(sessions.values()).filter(s => {
-    const owner = users.get(me);
-    return owner && s.userId === owner.id;
+    /* ── Friends ── */
+    case 'friends.list': {
+      const me = requireUser(client).username;
+      const friends = friendRequests
+        .filter((f) => (f.from === me || f.to === me) && f.status === 'accepted')
+        .map((f) => (f.from === me ? f.to : f.from));
+      return { friends };
+    }
+
+    case 'friends.request': {
+      const me = requireUser(client).username;
+      const target = p.username;
+      if (!users.has(target)) throw new RpcError('User not found');
+      const existing = friendRequests.find(
+        (f) => (f.from === me && f.to === target) || (f.from === target && f.to === me)
+      );
+      if (existing) throw new RpcError('Request already exists');
+      friendRequests.push({ id: uid(), from: me, to: target, status: 'pending' });
+      return { ok: true };
+    }
+
+    case 'friends.remove': {
+      requireUser(client);
+      const idx = friendRequests.findIndex((f) => f.id === p.id);
+      if (idx >= 0) friendRequests.splice(idx, 1);
+      return { ok: true };
+    }
+
+    /* ── Posts / Feed ── */
+    case 'posts.list': {
+      const limit = parseInt(p.limit) || 20;
+      const offset = parseInt(p.offset) || 0;
+      return { posts: posts.slice(offset, offset + limit), total: posts.length };
+    }
+
+    case 'posts.create': {
+      const user = requireUser(client);
+      const { content, media, gif } = p;
+      const post: Post = {
+        id: uid(),
+        userId: user.id,
+        username: user.username,           // ← NEW
+        content,
+        media,
+        gif,
+        createdAt: Date.now(),
+      };
+      posts.unshift(post);
+      broadcast('post:new', post);
+      return { post };
+    }
+
+    /* ── Sessions ── */
+    case 'sessions.list': {
+      const user = requireUser(client);
+      const list = Array.from(sessions.values())
+        .filter((s) => s.userId === user.id)
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .map((s) => ({ id: s.id, title: s.title, createdAt: s.createdAt }));
+      return { sessions: list };
+    }
+
+    case 'sessions.delete': {
+      const user = requireUser(client);
+      const s = sessions.get(p.id);
+      if (s && s.userId === user.id) sessions.delete(p.id);
+      return { ok: true };
+    }
+
+    case 'history.get': {
+      const user = requireUser(client);
+      const session = sessions.get(p.sessionId);
+      if (!session || session.userId !== user.id) throw new RpcError('Not found');
+      return { history: session.messages };
+    }
+
+    /* ── Chat ── */
+    case 'chat.send': {
+      const user = requireUser(client);
+      const { message, sessionId } = p;
+      if (!message) throw new RpcError('Empty message');
+
+      let session = sessionId ? sessions.get(sessionId) : undefined;
+      if (!session || session.userId !== user.id) {
+        session = {
+          id: uid(),
+          userId: user.id,
+          title: String(message).slice(0, 30),
+          messages: [],
+          createdAt: Date.now(),
+        };
+        sessions.set(session.id, session);
+      }
+
+      session.messages.push({ role: 'user', content: message, ts: Date.now() });
+      const reply = `Η Ήρα λέει: ${message}`;
+      session.messages.push({ role: 'assistant', content: reply, ts: Date.now() });
+
+      return { reply, sessionId: session.id };
+    }
+
+    /* ── Threads ── */
+    case 'threads.list': {
+      const filtered = p.category ? threads.filter((t) => t.category === p.category) : threads;
+      return { threads: filtered };
+    }
+
+    case 'threads.create': {
+      const user = requireUser(client);
+      const { category, title, content } = p;
+      const thread: Thread = {
+        id: uid(),
+        userId: user.id,
+        category,
+        title,
+        content,
+        createdAt: Date.now(),
+      };
+      threads.unshift(thread);
+      broadcast('thread:new', thread);
+      return { thread };
+    }
+
+    /* ── GIPHY proxy ── */
+    case 'gifs.search': {
+      const q = p.q || 'trending';
+      const gurl = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(
+        q
+      )}&limit=20`;
+      const resp = await fetch(gurl);
+      return await resp.json();
+    }
+
+    default:
+      throw new RpcError(`Unknown message type: ${type}`);
+  }
+}
+
+// ── Connection lifecycle ──
+wss.on('connection', (ws: WebSocket) => {
+  const client: ClientState = { ws, alive: true };
+  clients.add(client);
+
+  ws.on('pong', () => {
+    client.alive = true;
   });
-  res.json({ sessions: userSessions.map(s => ({ id: s.id, title: s.title, createdAt: s.createdAt })) });
+
+  ws.on('message', async (raw) => {
+    let msg: any;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+    if (!msg || typeof msg.type !== 'string') return;
+
+    const { id, type, ...payload } = msg;
+    try {
+      const data = await handle(type, payload, client);
+      if (id !== undefined) send(ws, { id, ok: true, data });
+    } catch (err: any) {
+      if (id !== undefined) send(ws, { id, ok: false, error: err?.message || 'Error' });
+    }
+  });
+
+  ws.on('close', () => clients.delete(client));
+  ws.on('error', () => clients.delete(client));
 });
 
-app.delete('/api/sessions/:id', auth, (req, res) => {
-  sessions.delete(req.params.id);
-  res.json({ ok: true });
-});
-
-app.get('/api/history/:sessionId', auth, (req, res) => {
-  const session = sessions.get(req.params.sessionId);
-  if (!session) return res.status(404).json({ error: 'Not found' });
-  res.json({ history: session.messages });
-});
-
-// ── Chat ──
-app.post('/api/chat', auth, (req, res) => {
-  const { message, sessionId } = req.body;
-  const me = (req as any).user.username;
-  const user = users.get(me);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-
-  let session = sessionId ? sessions.get(sessionId) : null;
-  if (!session) {
-    session = { id: uid(), userId: user.id, title: message.slice(0, 30), messages: [], createdAt: Date.now() };
-    sessions.set(session.id, session);
+// Heartbeat: drop sockets that stop responding to pings.
+const heartbeat = setInterval(() => {
+  for (const c of clients) {
+    if (!c.alive) {
+      c.ws.terminate();
+      clients.delete(c);
+      continue;
+    }
+    c.alive = false;
+    try {
+      c.ws.ping();
+    } catch {
+      /* ignore */
+    }
   }
-  session.messages.push({ role: 'user', content: message, ts: Date.now() });
-  const reply = `Η Ήρα λέει: ${message}`;
-  session.messages.push({ role: 'assistant', content: reply, ts: Date.now() });
-  res.json({ reply, sessionId: session.id });
-});
+}, 30000);
 
-// ── Threads ──
-app.get('/api/threads', (req, res) => {
-  const { category } = req.query;
-  const filtered = category ? threads.filter(t => t.category === category) : threads;
-  res.json({ threads: filtered });
-});
+wss.on('close', () => clearInterval(heartbeat));
 
-app.post('/api/threads', auth, (req, res) => {
-  const { category, title, content } = req.body;
-  const user = users.get((req as any).user.username);
-  if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const thread: Thread = { id: uid(), userId: user.id, category, title, content, createdAt: Date.now() };
-  threads.unshift(thread);
-  res.json({ thread });
-});
-
-// ── GIPHY proxy ──
-app.get('/api/gifs/search', async (req, res) => {
-  const q = req.query.q || 'trending';
-  const url = `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_KEY}&q=${encodeURIComponent(q as string)}&limit=20`;
-  try {
-    const resp = await fetch(url);
-    const data = await resp.json();
-    res.json(data);
-  } catch {
-    res.status(500).json({ error: 'GIPHY error' });
-  }
-});
-
-app.listen(PORT, () => console.log(`tox.gr backend running on http://localhost:${PORT}`));
+server.listen(PORT, () =>
+  console.log(`tox.gr backend (websocket) running on http://localhost:${PORT}`)
+);
